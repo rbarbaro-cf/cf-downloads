@@ -33,11 +33,10 @@ if (!(Get-Module Veeam.Backup.PowerShell -ErrorAction SilentlyContinue)) { Write
 
 # Fetch all normal repositories
 $normalRepos = Get-VBRBackupRepository |
-                Where-Object { $_.Info.CachedTotalSpace -gt 0 } |
                 Select-Object Name,
                               @{Name="TotalSpace";Expression={[math]::Round($PSItem.Info.CachedTotalSpace / 1GB)}},
                               @{Name="FreeSpace";Expression={[math]::Round($PSItem.Info.CachedFreeSpace / 1GB)}},
-                              @{Name="Utilized";Expression={[math]::Round((100*($PSItem.Info.CachedTotalSpace-$PSItem.Info.CachedFreeSpace) / $PSItem.Info.CachedTotalSpace))}}
+                              @{Name="Utilized";Expression={ if ($PSItem.Info.CachedTotalSpace -gt 0) { [math]::Round((100*($PSItem.Info.CachedTotalSpace-$PSItem.Info.CachedFreeSpace) / $PSItem.Info.CachedTotalSpace)) } else { 0 } }}
 
 # Fetch all scaleout-repositories
 $scaleoutRepos = foreach ($scaleoutRepo in (Get-VBRBackupRepository -ScaleOut -ErrorAction SilentlyContinue))
@@ -52,17 +51,16 @@ $scaleoutRepos = foreach ($scaleoutRepo in (Get-VBRBackupRepository -ScaleOut -E
         $freeSpace += $scaleoutExtent.Repository.Info.CachedFreeSpace
     }
 
-    # Skip scaleout repos with no space reported
-    if ($totalSpace -le 0) { continue }
-
+    # Handle repos with no space reported
     $totalSpaceGB = [math]::Round($totalSpace / 1GB)
     $freeSpaceGB = [math]::Round($freeSpace / 1GB)
+    $utilized = if ($totalSpaceGB -gt 0) { [math]::Round((100 * ($totalSpaceGB - $freeSpaceGB) / $totalSpaceGB)) } else { 0 }
 
     New-Object psobject -Property @{
         Name = $scaleoutRepo.Name
         TotalSpace = $totalSpaceGB
         FreeSpace = $freeSpaceGB
-        Utilized = [math]::Round((100 * ($totalSpaceGB - $freeSpaceGB) / $totalSpaceGB))
+        Utilized = $utilized
     }
 }
 
