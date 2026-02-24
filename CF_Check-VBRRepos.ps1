@@ -1,8 +1,8 @@
 ################################################################################
 # Nagios powershell script to ask Veeam of repository space usage              #
 # Author: Tomas Stanislawski (http://www.hkr.se/)                              #
-# Updated: 2025 - Added v12 module support, name filter, null-safe handling    #
-# Version: 2.0                                                                 #
+# Updated: 2025 - v12 module support, GetContainer(), name filter              #
+# Version: 2.1                                                                 #
 ################################################################################
 
 # Parameters
@@ -31,36 +31,62 @@ Import-Module Veeam.Backup.PowerShell -DisableNameChecking -ErrorAction Silently
 # Check if module is loaded
 if (!(Get-Module Veeam.Backup.PowerShell -ErrorAction SilentlyContinue)) { Write-Host "UNKNOWN - Missing Veeam PowerShell Module"; Exit $returnUnknown }
 
-# Fetch all normal repositories
-$normalRepos = Get-VBRBackupRepository |
-                Select-Object Name,
-                              @{Name="TotalSpace";Expression={[math]::Round($PSItem.Info.CachedTotalSpace / 1GB)}},
-                              @{Name="FreeSpace";Expression={[math]::Round($PSItem.Info.CachedFreeSpace / 1GB)}},
-                              @{Name="Utilized";Expression={ if ($PSItem.Info.CachedTotalSpace -gt 0) { [math]::Round((100*($PSItem.Info.CachedTotalSpace-$PSItem.Info.CachedFreeSpace) / $PSItem.Info.CachedTotalSpace)) } else { 0 } }}
+# Fetch all normal repositories and get space from GetContainer()
+$normalRepos = foreach ($repo in (Get-VBRBackupRepository)) {
+    try {
+        $container = $repo.GetContainer()
+        $totalBytes = $container.CachedTotalSpace.InBytes
+        $freeBytes = $container.CachedFreeSpace.InBytes
 
-# Fetch all scaleout-repositories
-$scaleoutRepos = foreach ($scaleoutRepo in (Get-VBRBackupRepository -ScaleOut -ErrorAction SilentlyContinue))
-{
-    $scaleoutExtents = $scaleoutRepo | Get-VBRRepositoryExtent
-    $totalSpace = 0
-    $freeSpace = 0
-
-    foreach ($scaleoutExtent in $scaleoutExtents)
-    {
-        $totalSpace += $scaleoutExtent.Repository.Info.CachedTotalSpace
-        $freeSpace += $scaleoutExtent.Repository.Info.CachedFreeSpace
+        # Fall back to raw numeric if .InBytes doesn't exist
+        if ($null -eq $totalBytes) { $totalBytes = [long]$container.CachedTotalSpace }
+        if ($null -eq $freeBytes) { $freeBytes = [long]$container.CachedFreeSpace }
+    } catch {
+        $totalBytes = 0
+        $freeBytes = 0
     }
 
-    # Handle repos with no space reported
-    $totalSpaceGB = [math]::Round($totalSpace / 1GB)
-    $freeSpaceGB = [math]::Round($freeSpace / 1GB)
-    $utilized = if ($totalSpaceGB -gt 0) { [math]::Round((100 * ($totalSpaceGB - $freeSpaceGB) / $totalSpaceGB)) } else { 0 }
+    $totalGB = [math]::Round($totalBytes / 1GB, 1)
+    $freeGB = [math]::Round($freeBytes / 1GB, 1)
+    $utilized = if ($totalGB -gt 0) { [math]::Round((($totalGB - $freeGB) / $totalGB) * 100) } else { 0 }
 
     New-Object psobject -Property @{
-        Name = $scaleoutRepo.Name
-        TotalSpace = $totalSpaceGB
-        FreeSpace = $freeSpaceGB
-        Utilized = $utilized
+        Name       = $repo.Name
+        TotalSpace = $totalGB
+        FreeSpace  = $freeGB
+        Utilized   = $utilized
+    }
+}
+
+# Fetch all scaleout-repositories
+$scaleoutRepos = foreach ($scaleoutRepo in (Get-VBRBackupRepository -ScaleOut -ErrorAction SilentlyContinue)) {
+    $totalBytes = 0
+    $freeBytes = 0
+
+    $scaleoutExtents = $scaleoutRepo | Get-VBRRepositoryExtent
+    foreach ($extent in $scaleoutExtents) {
+        try {
+            $container = $extent.Repository.GetContainer()
+            $extTotal = $container.CachedTotalSpace.InBytes
+            $extFree = $container.CachedFreeSpace.InBytes
+            if ($null -eq $extTotal) { $extTotal = [long]$container.CachedTotalSpace }
+            if ($null -eq $extFree) { $extFree = [long]$container.CachedFreeSpace }
+            $totalBytes += $extTotal
+            $freeBytes += $extFree
+        } catch {
+            # Skip extents we can't read
+        }
+    }
+
+    $totalGB = [math]::Round($totalBytes / 1GB, 1)
+    $freeGB = [math]::Round($freeBytes / 1GB, 1)
+    $utilized = if ($totalGB -gt 0) { [math]::Round((($totalGB - $freeGB) / $totalGB) * 100) } else { 0 }
+
+    New-Object psobject -Property @{
+        Name       = $scaleoutRepo.Name
+        TotalSpace = $totalGB
+        FreeSpace  = $freeGB
+        Utilized   = $utilized
     }
 }
 
