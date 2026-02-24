@@ -103,8 +103,20 @@ if ($List) {
 
 # Filter by name if specified (wildcard match)
 if ($Name) {
-    $allRepos = $allRepos | Where-Object { $_.Name -like "*$Name*" }
-    if ($allRepos.Count -lt 1) { Write-Host "UNKNOWN - Repository matching '$Name' not found"; Exit $returnUnknown }
+    $Name = $Name.Trim()
+    $matched = @()
+    foreach ($r in $allRepos) {
+        $repoName = $r.Name.Trim()
+        if ($repoName -like "*$Name*") { $matched += $r }
+    }
+    if ($matched.Count -lt 1) {
+        Write-Host "UNKNOWN - Repository matching '$Name' not found"
+        Write-Host "DEBUG - Available names and lengths:"
+        foreach ($r in $allRepos) { Write-Host "  [$($r.Name)] (Length: $($r.Name.Length)) (Trimmed: $($r.Name.Trim().Length))" }
+        Write-Host "DEBUG - Search term: [$Name] (Length: $($Name.Length))"
+        Exit $returnUnknown
+    }
+    $allRepos = $matched
 }
 
 # Do some error checking, if no repos found do a quick exit
