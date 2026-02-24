@@ -1,11 +1,10 @@
 ################################################################################
-# Nagios powershell script to ask Veeam of repository space usage              #
-# Author: Tomas Stanislawski (http://www.hkr.se/)                              #
-# Updated: 2025 - v12 module support, GetContainer(), name filter              #
-# Version: 2.1                                                                 #
+# Nagios powershell script to check Veeam repository space usage               #
+# Original Author: Tomas Stanislawski (http://www.hkr.se/)                     #
+# Updated: 2025 - Veeam v12 module support, GetContainer(), name filter        #
+# Version: 2.2                                                                 #
 ################################################################################
 
-# Parameters
 param(
     [string]$Name,
     [int]$Warning = 95,
@@ -24,22 +23,17 @@ $returnCode = $returnOK
 $nagiosTextstatus = "OK"
 $nagiosTextoutput = "All repositories within limits"
 $nagiosPerformanceData = ""
-$nagiosLongtext = ""
 
 # Load Veeam PowerShell module (v12+)
 Import-Module Veeam.Backup.PowerShell -DisableNameChecking -ErrorAction SilentlyContinue
-
-# Check if module is loaded
 if (!(Get-Module Veeam.Backup.PowerShell -ErrorAction SilentlyContinue)) { Write-Host "UNKNOWN - Missing Veeam PowerShell Module"; Exit $returnUnknown }
 
-# Fetch all normal repositories and get space from GetContainer()
+# Fetch all normal repositories using GetContainer() for accurate space data
 $normalRepos = foreach ($repo in (Get-VBRBackupRepository)) {
     try {
         $container = $repo.GetContainer()
         $totalBytes = $container.CachedTotalSpace.InBytes
         $freeBytes = $container.CachedFreeSpace.InBytes
-
-        # Fall back to raw numeric if .InBytes doesn't exist
         if ($null -eq $totalBytes) { $totalBytes = [long]$container.CachedTotalSpace }
         if ($null -eq $freeBytes) { $freeBytes = [long]$container.CachedFreeSpace }
     } catch {
@@ -64,8 +58,7 @@ $scaleoutRepos = foreach ($scaleoutRepo in (Get-VBRBackupRepository -ScaleOut -E
     $totalBytes = 0
     $freeBytes = 0
 
-    $scaleoutExtents = $scaleoutRepo | Get-VBRRepositoryExtent
-    foreach ($extent in $scaleoutExtents) {
+    foreach ($extent in ($scaleoutRepo | Get-VBRRepositoryExtent)) {
         try {
             $container = $extent.Repository.GetContainer()
             $extTotal = $container.CachedTotalSpace.InBytes
@@ -74,9 +67,7 @@ $scaleoutRepos = foreach ($scaleoutRepo in (Get-VBRBackupRepository -ScaleOut -E
             if ($null -eq $extFree) { $extFree = [long]$container.CachedFreeSpace }
             $totalBytes += $extTotal
             $freeBytes += $extFree
-        } catch {
-            # Skip extents we can't read
-        }
+        } catch {}
     }
 
     $totalGB = [math]::Round($totalBytes / 1GB, 1)
@@ -94,62 +85,47 @@ $scaleoutRepos = foreach ($scaleoutRepo in (Get-VBRBackupRepository -ScaleOut -E
 # Combine all repos
 $allRepos = @($normalRepos) + @($scaleoutRepos) | Where-Object { $_ -ne $null }
 
-# List mode - just show available repo names and exit
+# List mode - show available repo names and exit
 if ($List) {
     Write-Host "Available repositories:"
-    foreach ($r in $allRepos) { Write-Host "  [$($r.Name)]" }
+    foreach ($r in $allRepos) { Write-Host "  [$($r.Name.Trim())]" }
     Exit 0
 }
 
-# Filter by name if specified (wildcard match)
+# Filter by name if specified
 if ($Name) {
     $Name = $Name.Trim()
     $matched = @()
     foreach ($r in $allRepos) {
-        $repoName = $r.Name.Trim()
-        if ($repoName -like "*$Name*") { $matched += $r }
+        if ($r.Name.Trim() -like "*$Name*") { $matched += $r }
     }
-    if ($matched.Count -lt 1) {
-        Write-Host "UNKNOWN - Repository matching '$Name' not found"
-        Write-Host "DEBUG - Available names and lengths:"
-        foreach ($r in $allRepos) { Write-Host "  [$($r.Name)] (Length: $($r.Name.Length)) (Trimmed: $($r.Name.Trim().Length))" }
-        Write-Host "DEBUG - Search term: [$Name] (Length: $($Name.Length))"
-        Exit $returnUnknown
-    }
+    if ($matched.Count -lt 1) { Write-Host "UNKNOWN - Repository matching '$Name' not found"; Exit $returnUnknown }
     $allRepos = $matched
 }
 
-# Do some error checking, if no repos found do a quick exit
+# No repos found
 if ($allRepos.Count -lt 1) { Write-Host "UNKNOWN - No repositories could be found"; Exit $returnUnknown }
 
-# Get longest values for output padding
-$padTotalSpace = ($allRepos.TotalSpace | Sort-Object -Descending | Select-Object -First 1).ToString().Length
-$padFreeSpace = ($allRepos.FreeSpace | Sort-Object -Descending | Select-Object -First 1).ToString().Length
-$padName = ($allRepos.Name | ForEach-Object { $_.Length } | Sort-Object -Descending | Select-Object -First 1)
-
+# Evaluate thresholds and build perfdata
 foreach ($repo in ($allRepos | Sort-Object -Property TotalSpace -Descending))
 {
-    if ($repo.Utilized -lt $Warning)
-    {
-        $nagiosPerformanceData = $nagiosPerformanceData + '''' + $repo.Name + ' used''=' + ($repo.TotalSpace - $repo.FreeSpace) + 'GB;;;0;' + $repo.TotalSpace + ' ''' + $repo.Name + ' utilization''=' + $repo.Utilized + '%' + ";$Warning;$Critical;0;100 "
-        $nagiosLongtext = $nagiosLongtext + $repo.Name.PadRight($padName," ") + " Free space " + $repo.FreeSpace.ToString().PadLeft($padFreeSpace," ") + 'GB of ' + $repo.TotalSpace.ToString().PadLeft($padTotalSpace," ") + 'GB (' + $repo.Utilized.ToString().PadLeft(3," ") + '% utilized)' + "`n"
-    } elseif (($repo.Utilized -ge $Warning) -and ($repo.Utilized -lt $Critical)) {
+    $repoName = $repo.Name.Trim()
+    $usedGB = $repo.TotalSpace - $repo.FreeSpace
+    $nagiosPerformanceData += "'${repoName} used'=${usedGB}GB;;;0;$($repo.TotalSpace) '${repoName} utilization'=$($repo.Utilized)%;$Warning;$Critical;0;100 "
+
+    if (($repo.Utilized -ge $Warning) -and ($repo.Utilized -lt $Critical) -and ($returnCode -lt $returnWarning)) {
         $returnCode = $returnWarning
         $nagiosTextstatus = "WARNING"
-        $nagiosTextoutput = "One or more repositories are in warning state, please see extended output"
-        $nagiosPerformanceData = $nagiosPerformanceData + '''' + $repo.Name + ' used''=' + ($repo.TotalSpace - $repo.FreeSpace) + 'GB;;;0;' + $repo.TotalSpace + ' ''' + $repo.Name + ' utilization''=' + $repo.Utilized + '%' + ";$Warning;$Critical;0;100 "
-        $nagiosLongtext = $nagiosLongtext + $repo.Name.PadRight($padName," ") + " Free space " + $repo.FreeSpace.ToString().PadLeft($padFreeSpace," ") + 'GB of ' + $repo.TotalSpace.ToString().PadLeft($padTotalSpace," ") + 'GB (' + $repo.Utilized.ToString().PadLeft(3," ") + '% utilized - WARNING)' + "`n"
-    } elseif ($repo.Utilized -ge $Critical) {
+        $nagiosTextoutput = "One or more repositories in warning state"
+    }
+    if (($repo.Utilized -ge $Critical) -and ($returnCode -lt $returnCritical)) {
         $returnCode = $returnCritical
         $nagiosTextstatus = "CRITICAL"
-        $nagiosTextoutput = "One or more repositories are in critical state, please see extended output"
-        $nagiosPerformanceData = $nagiosPerformanceData + '''' + $repo.Name + ' used''=' + ($repo.TotalSpace - $repo.FreeSpace) + 'GB;;;0;' + $repo.TotalSpace + ' ''' + $repo.Name + ' utilization''=' + $repo.Utilized + '%' + ";$Warning;$Critical;0;100 "
-        $nagiosLongtext = $nagiosLongtext + $repo.Name.PadRight($padName," ") + " Free space " + $repo.FreeSpace.ToString().PadLeft($padFreeSpace," ") + 'GB of ' + $repo.TotalSpace.ToString().PadLeft($padTotalSpace," ") + 'GB (' + $repo.Utilized.ToString().PadLeft(3," ") + '% utilized - CRITICAL)' + "`n"
+        $nagiosTextoutput = "One or more repositories in critical state"
     }
 }
 
-# Dump the results
-Write-Host "$nagiosTextstatus - $nagiosTextoutput|$nagiosPerformanceData`n$nagiosLongtext" -NoNewline
+# Output single Nagios status line with perfdata
+Write-Host "$nagiosTextstatus - $nagiosTextoutput|$nagiosPerformanceData" -NoNewline
 
-# And exit with a code
 Exit $returnCode
