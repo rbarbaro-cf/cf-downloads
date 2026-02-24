@@ -9,7 +9,8 @@
 param(
     [string]$Name,
     [int]$Warning = 95,
-    [int]$Critical = 99
+    [int]$Critical = 99,
+    [switch]$List
 )
 
 # Exit codes
@@ -93,10 +94,17 @@ $scaleoutRepos = foreach ($scaleoutRepo in (Get-VBRBackupRepository -ScaleOut -E
 # Combine all repos
 $allRepos = @($normalRepos) + @($scaleoutRepos) | Where-Object { $_ -ne $null }
 
-# Filter by name if specified
+# List mode - just show available repo names and exit
+if ($List) {
+    Write-Host "Available repositories:"
+    foreach ($r in $allRepos) { Write-Host "  [$($r.Name)]" }
+    Exit 0
+}
+
+# Filter by name if specified (wildcard match)
 if ($Name) {
-    $allRepos = $allRepos | Where-Object { $_.Name -eq $Name }
-    if ($allRepos.Count -lt 1) { Write-Host "UNKNOWN - Repository '$Name' not found"; Exit $returnUnknown }
+    $allRepos = $allRepos | Where-Object { $_.Name -like "*$Name*" }
+    if ($allRepos.Count -lt 1) { Write-Host "UNKNOWN - Repository matching '$Name' not found"; Exit $returnUnknown }
 }
 
 # Do some error checking, if no repos found do a quick exit
