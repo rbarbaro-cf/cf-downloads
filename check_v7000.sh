@@ -40,22 +40,28 @@
 ssh=/usr/bin/ssh
 exitCode=0
 
-while getopts 'M:U:Q:i:d:h' OPT; do
+while getopts 'M:U:Q:i:w:c:d:h' OPT; do
   case $OPT in
     M)  storage=$OPTARG;;
     U)  user=$OPTARG;;
     Q)  query=$OPTARG;;
     i)  identity=$OPTARG;;
+    w)  warn=$OPTARG;;
+    c)  crit=$OPTARG;;
     h)  hlp="yes";;
     *)  unknown="yes";;
   esac
 done
 
+# Defaults for space checks
+warn=${warn:-80}
+crit=${crit:-90}
+
 # usage
 HELP="
     Check an IBM Storwize v3700 / v7000 throught SSH (GPL licence)
 
-    usage: $0 [ -M value -U value -i full-path-to-file -Q command-h ]
+    usage: $0 [ -M value -U value -i full-path-to-file -Q command -w value -c value -h ]
 
     syntax:
 
@@ -65,6 +71,8 @@ HELP="
 		lsarray
 		lsdrive
 		lsvdisk
+		lsvdiskspace
+		lspoolspace
 		lsenclosure
 		lsenclosurebattery
 		lsenclosurecanister
@@ -73,6 +81,8 @@ HELP="
 		lsrcrelationship
 		unified
 	    -i --> Provide the SSH identity file to use
+	    -w --> Warning threshold % for space checks (default: 80)
+	    -c --> Critical threshold % for space checks (default: 90)
             -h --> Print This Help Screen
 
     Note :
@@ -365,6 +375,107 @@ case $query in
 		outputMess=`uniq "$tmp_file_OK"`;
 	fi
   	;;
+	lsvdiskspace)
+		# Check vdisk capacity usage with warning/critical thresholds
+		$ssh $user@$storage -i $identity lsvdisk -bytes -delim : -nohdr > $tmp_file
+
+		if [ ! -s $tmp_file ]; then
+			outputMess="CRITICAL: No vdisk data returned \n"
+			exitCode=2
+		else
+			# Get header to find column positions
+			header=$($ssh $user@$storage -i $identity lsvdisk -bytes -delim : | head -1)
+			IFS=':' read -ra cols <<< "$header"
+			name_col=-1; cap_col=-1; used_col=-1
+			for i in "${!cols[@]}"; do
+				case "${cols[$i]}" in
+					name) name_col=$i;;
+					capacity) cap_col=$i;;
+					used_capacity) used_col=$i;;
+				esac
+			done
+
+			if [ $name_col -eq -1 -o $cap_col -eq -1 -o $used_col -eq -1 ]; then
+				outputMess="UNKNOWN: Could not parse lsvdisk column headers \n"
+				exitCode=3
+			else
+				outputMess="OK: VDisk Space \n"
+				while IFS=':' read -ra fields; do
+					vd_name="${fields[$name_col]}"
+					vd_cap="${fields[$cap_col]}"
+					vd_used="${fields[$used_col]}"
+
+					if [ "$vd_cap" -gt 0 ] 2>/dev/null; then
+						pct=$(( vd_used * 100 / vd_cap ))
+						vd_cap_gb=$(( vd_cap / 1073741824 ))
+						vd_used_gb=$(( vd_used / 1073741824 ))
+
+						if [ $pct -ge $crit ]; then
+							outputMess="$outputMess CRITICAL: VDisk $vd_name ${pct}% used (${vd_used_gb}GB/${vd_cap_gb}GB) \n"
+							exitCode=2
+						elif [ $pct -ge $warn ]; then
+							outputMess="$outputMess WARNING: VDisk $vd_name ${pct}% used (${vd_used_gb}GB/${vd_cap_gb}GB) \n"
+							if [ $exitCode -lt 2 ]; then exitCode=1; fi
+						else
+							outputMess="$outputMess OK: VDisk $vd_name ${pct}% used (${vd_used_gb}GB/${vd_cap_gb}GB) \n"
+						fi
+					fi
+				done < $tmp_file
+			fi
+		fi
+	;;
+
+	lspoolspace)
+		# Check storage pool capacity usage with warning/critical thresholds
+		$ssh $user@$storage -i $identity lsmdiskgrp -bytes -delim : -nohdr > $tmp_file
+
+		if [ ! -s $tmp_file ]; then
+			outputMess="CRITICAL: No pool data returned \n"
+			exitCode=2
+		else
+			header=$($ssh $user@$storage -i $identity lsmdiskgrp -bytes -delim : | head -1)
+			IFS=':' read -ra cols <<< "$header"
+			name_col=-1; cap_col=-1; free_col=-1
+			for i in "${!cols[@]}"; do
+				case "${cols[$i]}" in
+					name) name_col=$i;;
+					capacity) cap_col=$i;;
+					free_capacity) free_col=$i;;
+				esac
+			done
+
+			if [ $name_col -eq -1 -o $cap_col -eq -1 -o $free_col -eq -1 ]; then
+				outputMess="UNKNOWN: Could not parse lsmdiskgrp column headers \n"
+				exitCode=3
+			else
+				outputMess="OK: Pool Space \n"
+				while IFS=':' read -ra fields; do
+					pool_name="${fields[$name_col]}"
+					pool_cap="${fields[$cap_col]}"
+					pool_free="${fields[$free_col]}"
+
+					if [ "$pool_cap" -gt 0 ] 2>/dev/null; then
+						pool_used=$(( pool_cap - pool_free ))
+						pct=$(( pool_used * 100 / pool_cap ))
+						pool_cap_gb=$(( pool_cap / 1073741824 ))
+						pool_free_gb=$(( pool_free / 1073741824 ))
+						pool_used_gb=$(( pool_used / 1073741824 ))
+
+						if [ $pct -ge $crit ]; then
+							outputMess="$outputMess CRITICAL: Pool $pool_name ${pct}% used (${pool_used_gb}GB/${pool_cap_gb}GB, ${pool_free_gb}GB free) \n"
+							exitCode=2
+						elif [ $pct -ge $warn ]; then
+							outputMess="$outputMess WARNING: Pool $pool_name ${pct}% used (${pool_used_gb}GB/${pool_cap_gb}GB, ${pool_free_gb}GB free) \n"
+							if [ $exitCode -lt 2 ]; then exitCode=1; fi
+						else
+							outputMess="$outputMess OK: Pool $pool_name ${pct}% used (${pool_used_gb}GB/${pool_cap_gb}GB, ${pool_free_gb}GB free) \n"
+						fi
+					fi
+				done < $tmp_file
+			fi
+		fi
+	;;
+
 	*)
 		echo -ne "Command not found. \n"
 		exit 3
