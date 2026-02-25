@@ -255,50 +255,58 @@ if ($Check -eq "BackupAge") {
     $nagiosTextstatus = "OK"
     $nagiosTextoutput = "All backups within age limits"
     $nagiosPerformanceData = ""
-    $warningVMs = @()
-    $criticalVMs = @()
+    $warningJobs = @()
+    $criticalJobs = @()
     $now = Get-Date
 
-    $allRestorePoints = Get-VBRRestorePoint -ErrorAction SilentlyContinue
-    if ($null -eq $allRestorePoints -or $allRestorePoints.Count -lt 1) {
-        Write-Host "UNKNOWN - No restore points found"
+    $jobs = Get-VBRJob -ErrorAction SilentlyContinue
+    if ($null -eq $jobs -or $jobs.Count -lt 1) {
+        Write-Host "UNKNOWN - No backup jobs found"
         Exit $returnUnknown
     }
 
-    # Group by VM name and get latest restore point per VM
-    $vmGroups = $allRestorePoints | Group-Object -Property Name
+    foreach ($job in $jobs) {
+        $jobName = $job.Name.Trim()
 
-    foreach ($vmGroup in $vmGroups) {
-        $vmName = $vmGroup.Name.Trim()
-
-        # Skip excluded VMs
+        # Skip excluded jobs
         $skip = $false
         foreach ($ex in $excludeList) {
-            if ($vmName -like "*$ex*") { $skip = $true; break }
+            if ($jobName -like "*$ex*") { $skip = $true; break }
         }
         if ($skip) { continue }
 
-        $latestRP = $vmGroup.Group | Sort-Object -Property CreationTime -Descending | Select-Object -First 1
-        $ageHours = [math]::Round(($now - $latestRP.CreationTime).TotalHours, 1)
+        # Get last successful session for this job
+        $lastSession = Get-VBRBackupSession -ErrorAction SilentlyContinue |
+            Where-Object { $_.JobId -eq $job.Id -and $_.Result -ne "Failed" -and $_.State -eq "Stopped" } |
+            Sort-Object -Property EndTime -Descending |
+            Select-Object -First 1
 
-        $nagiosPerformanceData += "'${vmName} age'=${ageHours}h;$Warning;$Critical;0; "
+        if ($null -eq $lastSession) {
+            $criticalJobs += "$jobName (no successful session found)"
+            if ($returnCode -lt $returnCritical) { $returnCode = $returnCritical }
+            continue
+        }
+
+        $ageHours = [math]::Round(($now - $lastSession.EndTime).TotalHours, 1)
+
+        $nagiosPerformanceData += "'${jobName} age'=${ageHours}h;$Warning;$Critical;0; "
 
         if ($ageHours -ge $Critical) {
-            $criticalVMs += "$vmName (${ageHours}h)"
+            $criticalJobs += "$jobName (${ageHours}h)"
             if ($returnCode -lt $returnCritical) { $returnCode = $returnCritical }
         } elseif ($ageHours -ge $Warning) {
-            $warningVMs += "$vmName (${ageHours}h)"
+            $warningJobs += "$jobName (${ageHours}h)"
             if ($returnCode -lt $returnWarning) { $returnCode = $returnWarning }
         }
     }
 
     if ($returnCode -eq $returnCritical) {
         $nagiosTextstatus = "CRITICAL"
-        $nagiosTextoutput = "Stale backups: " + ($criticalVMs -join ", ")
-        if ($warningVMs.Count -gt 0) { $nagiosTextoutput += " | Aging: " + ($warningVMs -join ", ") }
+        $nagiosTextoutput = "Stale backups: " + ($criticalJobs -join ", ")
+        if ($warningJobs.Count -gt 0) { $nagiosTextoutput += " | Aging: " + ($warningJobs -join ", ") }
     } elseif ($returnCode -eq $returnWarning) {
         $nagiosTextstatus = "WARNING"
-        $nagiosTextoutput = "Aging backups: " + ($warningVMs -join ", ")
+        $nagiosTextoutput = "Aging backups: " + ($warningJobs -join ", ")
     }
 
     Write-Host "$nagiosTextstatus - $nagiosTextoutput|$nagiosPerformanceData" -NoNewline
