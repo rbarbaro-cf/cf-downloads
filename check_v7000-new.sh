@@ -117,6 +117,7 @@ fi
 tmp_file=/tmp/v7000_${storage}_${query}.tmp
 tmp_file_OK=/tmp/v7000_OK.tmp
 outputMess=""
+perfData=""
 
 # --- SSH Connectivity Test ---
 # Use lssystem as test command (echo not available in Storwize restricted shell)
@@ -678,6 +679,7 @@ case $query in
 				exitCode=3
 			else
 				outputMess="OK: Pool Space \n"
+				perfData=""
 				tmp_data="/tmp/v7000_${storage}_poolspace_data.tmp"
 				sed '1d' "$tmp_file" > "$tmp_data"
 				while IFS=':' read -ra fields; do
@@ -691,6 +693,13 @@ case $query in
 						pool_cap_gb=$(( pool_cap / 1073741824 ))
 						pool_free_gb=$(( pool_free / 1073741824 ))
 						pool_used_gb=$(( pool_used / 1073741824 ))
+
+						# Build perfdata: 'label'=value;warn;crit;min;max
+						warn_bytes=$(( pool_cap * warn / 100 ))
+						crit_bytes=$(( pool_cap * crit / 100 ))
+						perfData="$perfData '${pool_name}_used'=${pool_used}B;${warn_bytes};${crit_bytes};0;${pool_cap}"
+						perfData="$perfData '${pool_name}_pct'=${pct}%;${warn};${crit};0;100"
+						perfData="$perfData '${pool_name}_free'=${pool_free}B;;;0;${pool_cap}"
 
 						if [ $pct -ge $crit ]; then
 							outputMess="$outputMess CRITICAL: Pool $pool_name ${pct}% used (${pool_used_gb}GB/${pool_cap_gb}GB, ${pool_free_gb}GB free) \n"
@@ -716,5 +725,16 @@ esac
 
 rm -f $tmp_file
 # rm $tmp_file_OK
-echo -ne "$outputMess\n"
+if [ -n "$perfData" ]; then
+	# Nagios expects perfdata after | on the first line
+	# Split outputMess: first line gets perfdata, rest is long output
+	first_line=$(echo -ne "$outputMess" | head -1)
+	long_output=$(echo -ne "$outputMess" | tail -n +2)
+	echo "${first_line} |${perfData}"
+	if [ -n "$long_output" ]; then
+		echo "$long_output"
+	fi
+else
+	echo -ne "$outputMess\n"
+fi
 exit $exitCode
