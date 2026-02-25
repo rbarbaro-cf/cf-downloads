@@ -29,6 +29,11 @@ param(
     [string[]]$Arguments
 )
 
+# If all args came as a single string, split on spaces
+if ($Arguments.Count -eq 1 -and $Arguments[0] -match '\s') {
+    $Arguments = $Arguments[0].Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
+}
+
 # Parse arguments: first arg is check type, rest are key=value pairs
 $Check = ""
 $List = ""
@@ -277,7 +282,7 @@ if ($Check -eq "JobStatus") {
     if ($returnCode -eq $returnCritical) {
         $nagiosTextstatus = "CRITICAL"
         $nagiosTextoutput = "Failed: " + ($failedJobs -join ", ")
-        if ($warningJobs.Count -gt 0) { $nagiosTextoutput += " | Warnings: " + ($warningJobs -join ", ") }
+        if ($warningJobs.Count -gt 0) { $nagiosTextoutput += " -- Warnings: " + ($warningJobs -join ", ") }
     } elseif ($returnCode -eq $returnWarning) {
         $nagiosTextstatus = "WARNING"
         $nagiosTextoutput = "Warnings: " + ($warningJobs -join ", ")
@@ -342,7 +347,7 @@ if ($Check -eq "BackupAge") {
     if ($returnCode -eq $returnCritical) {
         $nagiosTextstatus = "CRITICAL"
         $nagiosTextoutput = "Stale backups: " + ($criticalJobs -join ", ")
-        if ($warningJobs.Count -gt 0) { $nagiosTextoutput += " | Aging: " + ($warningJobs -join ", ") }
+        if ($warningJobs.Count -gt 0) { $nagiosTextoutput += " -- Aging: " + ($warningJobs -join ", ") }
     } elseif ($returnCode -eq $returnWarning) {
         $nagiosTextstatus = "WARNING"
         $nagiosTextoutput = "Aging backups: " + ($warningJobs -join ", ")
