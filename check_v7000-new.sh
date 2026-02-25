@@ -5,8 +5,8 @@
 # Custom Version	1.4.1
 #
 # Modified:		2025 - Added SSH connectivity validation, lspoolspace,
-#			lsvdiskspace, lsportfc checks. Fixed false-OK on SSH failure.
-#			Fixed temp file variable interpolation.
+#			lsvdiskspace, lsportfc, lseventlog checks. Fixed false-OK
+#			on SSH failure. Fixed temp file variable interpolation.
 
 # Original Author:	Lazzarin Alberto
 # Original Date:	10-04-2013
@@ -19,6 +19,10 @@
 #
 #
 # CHANGELOG
+#
+# 1.6.0
+# Added lseventlog check for unresolved alert/warning events.
+# Fixed SSH connectivity test to use lssystem instead of echo (restricted shell).
 #
 # 1.5.0
 # Added SSH connectivity validation - all checks now return CRITICAL on SSH failure
@@ -85,6 +89,7 @@ HELP="
             -Q --> query to storage
 		lsarray
 		lsdrive
+		lseventlog
 		lsportfc
 		lsvdisk
 		lsvdiskspace
@@ -98,6 +103,7 @@ HELP="
 		unified
 	    -i --> Provide the SSH identity file to use
 	    -w --> Warning threshold % for space checks (default: 80)
+	           For lseventlog: use -w init to create baseline
 	    -c --> Critical threshold % for space checks (default: 90)
             -h --> Print This Help Screen
 
@@ -115,10 +121,10 @@ tmp_file_OK=/tmp/v7000_OK.tmp
 outputMess=""
 
 # --- SSH Connectivity Test ---
-# Test SSH before running any check to prevent false OKs
-ssh_test=$($ssh $user@$storage -i $identity "echo connected" 2>&1)
-if [ "$ssh_test" != "connected" ]; then
-        echo -ne "CRITICAL: SSH connection failed to $storage - $ssh_test\n"
+# Use lssystem as test command (echo not available in Storwize restricted shell)
+$ssh $user@$storage -i $identity lssystem > /dev/null 2>&1
+if [ "$?" -ne 0 ]; then
+        echo -ne "CRITICAL: SSH connection failed to $storage\n"
         exit 2
 fi
 
@@ -450,14 +456,15 @@ case $query in
 		else
 			header=$($ssh $user@$storage -i $identity lsportfc -delim : | head -1)
 			IFS=':' read -ra cols <<< "$header"
-			id_col=-1; status_col=-1; speed_col=-1; node_col=-1; att_speed_col=-1
+			id_col=-1; status_col=-1; speed_col=-1; nodeid_col=-1; nodename_col=-1; att_speed_col=-1
 			for i in "${!cols[@]}"; do
 				case "${cols[$i]}" in
 					id) id_col=$i;;
 					port_id) id_col=$i;;
 					status) status_col=$i;;
 					port_speed) speed_col=$i;;
-					node_name) node_col=$i;;
+					node_id) nodeid_col=$i;;
+					node_name) nodename_col=$i;;
 					attached_port_speed) att_speed_col=$i;;
 				esac
 			done
@@ -470,6 +477,14 @@ case $query in
 				while IFS=':' read -ra fields; do
 					fc_id="${fields[$id_col]}"
 					fc_status="${fields[$status_col]}"
+
+					# Get node identifier
+					fc_node=""
+					if [ $nodeid_col -ge 0 ]; then
+						fc_node="Node${fields[$nodeid_col]}"
+					elif [ $nodename_col -ge 0 ]; then
+						fc_node="${fields[$nodename_col]}"
+					fi
 
 					# Get speed if column exists
 					fc_speed=""
@@ -486,21 +501,135 @@ case $query in
 					if [ "$fc_status" = "active" -o "$fc_status" = "online" ]; then
 						# Port is up - check for speed mismatch if both speeds available
 						if [ -n "$fc_speed" -a -n "$fc_att_speed" -a "$fc_att_speed" != "" -a "$fc_speed" != "$fc_att_speed" ]; then
-							outputMess="$outputMess WARNING: FC Port $fc_id is $fc_status but speed mismatch (port: $fc_speed, attached: $fc_att_speed) \n"
+							outputMess="$outputMess WARNING: $fc_node FC Port $fc_id is $fc_status but speed mismatch (port: $fc_speed, attached: $fc_att_speed) \n"
 							if [ $exitCode -lt 2 ]; then exitCode=1; fi
 						else
-							outputMess="$outputMess OK: FC Port $fc_id status: $fc_status speed: $fc_speed \n"
+							outputMess="$outputMess OK: $fc_node FC Port $fc_id status: $fc_status speed: $fc_speed \n"
 						fi
-					elif [ "$fc_status" = "inactive_configured" -o "$fc_status" = "inactive_unconfigured" ]; then
-						# Port configured but not active
-						outputMess="$outputMess WARNING: FC Port $fc_id status: $fc_status \n"
+					elif [ "$fc_status" = "inactive_unconfigured" ]; then
+						# Unconfigured port - intentionally unused, OK
+						outputMess="$outputMess OK: $fc_node FC Port $fc_id status: $fc_status (unconfigured) \n"
+					elif [ "$fc_status" = "inactive_configured" ]; then
+						# Configured but not active - something is wrong
+						outputMess="$outputMess WARNING: $fc_node FC Port $fc_id status: $fc_status \n"
 						if [ $exitCode -lt 2 ]; then exitCode=1; fi
 					else
 						# Port in error, offline, or other bad state
-						outputMess="$outputMess CRITICAL: FC Port $fc_id status: $fc_status speed: $fc_speed \n"
+						outputMess="$outputMess CRITICAL: $fc_node FC Port $fc_id status: $fc_status speed: $fc_speed \n"
 						exitCode=2
 					fi
 				done < $tmp_file
+			fi
+		fi
+	;;
+
+	lseventlog)
+		# Check for unresolved alert events in the Storwize event log
+		# Uses a baseline file to track known events and only alert on new ones
+		# Exclude error codes that are covered by dedicated checks
+		EXCLUDE_CODES="986020"
+		baseline_file="/tmp/v7000_${storage}_eventlog.baseline"
+
+		# Init mode: create baseline from current alerts
+		if [ "$warn" = "init" ]; then
+			$ssh $user@$storage -i $identity "lseventlog -filtervalue status=alert:fixed=no -delim : -nohdr" > $tmp_file
+			if [ -f $tmp_file ]; then
+				# Extract sequence numbers, excluding filtered error codes
+				> "$baseline_file"
+				while IFS=':' read -ra fields; do
+					evt_errcode="${fields[8]}"
+					skip=0
+					for code in $EXCLUDE_CODES; do
+						if [ "$evt_errcode" = "$code" ]; then skip=1; break; fi
+					done
+					if [ $skip -eq 0 ]; then
+						echo "${fields[0]}" >> "$baseline_file"
+					fi
+				done < $tmp_file
+				evt_count=$(wc -l < "$baseline_file")
+				echo -ne "OK: Baseline created with $evt_count known events \n"
+				rm -f $tmp_file
+				exit 0
+			else
+				echo -ne "CRITICAL: Could not retrieve event log for baseline \n"
+				rm -f $tmp_file
+				exit 2
+			fi
+		fi
+
+		# Normal mode: check for new events not in baseline
+		$ssh $user@$storage -i $identity "lseventlog -filtervalue status=alert:fixed=no -delim : -nohdr" > $tmp_file
+
+		if [ ! -s $tmp_file ]; then
+			# No unfixed alerts at all
+			outputMess="OK: No unresolved events \n"
+			exitCode=0
+		else
+			# Get header for column mapping
+			header=$($ssh $user@$storage -i $identity "lseventlog -filtervalue status=alert:fixed=no -delim :" | head -1)
+			IFS=':' read -ra cols <<< "$header"
+			seq_col=-1; ts_col=-1; objtype_col=-1; objname_col=-1; eventid_col=-1; errcode_col=-1; desc_col=-1
+			for i in "${!cols[@]}"; do
+				case "${cols[$i]}" in
+					sequence_number) seq_col=$i;;
+					last_timestamp) ts_col=$i;;
+					object_type) objtype_col=$i;;
+					object_name) objname_col=$i;;
+					event_id) eventid_col=$i;;
+					error_code) errcode_col=$i;;
+					description) desc_col=$i;;
+				esac
+			done
+
+			if [ $seq_col -eq -1 -o $desc_col -eq -1 ]; then
+				outputMess="UNKNOWN: Could not parse lseventlog column headers \n"
+				exitCode=3
+			else
+				alert_count=0
+				event_summary=""
+
+				# Create baseline file if it doesn't exist (first run without init)
+				if [ ! -f "$baseline_file" ]; then
+					touch "$baseline_file"
+				fi
+
+				while IFS=':' read -ra fields; do
+					evt_seq="${fields[$seq_col]}"
+					evt_errcode=""
+					if [ $errcode_col -ge 0 ]; then evt_errcode="${fields[$errcode_col]}"; fi
+
+					# Skip excluded error codes
+					skip=0
+					for code in $EXCLUDE_CODES; do
+						if [ "$evt_errcode" = "$code" ]; then skip=1; break; fi
+					done
+					if [ $skip -eq 1 ]; then continue; fi
+
+					# Skip baselined events
+					if grep -q "^${evt_seq}$" "$baseline_file" 2>/dev/null; then continue; fi
+
+					# This is a new, non-excluded event
+					evt_ts=""
+					evt_objtype=""
+					evt_objname=""
+					evt_desc=""
+
+					if [ $ts_col -ge 0 ]; then evt_ts="${fields[$ts_col]}"; fi
+					if [ $objtype_col -ge 0 ]; then evt_objtype="${fields[$objtype_col]}"; fi
+					if [ $objname_col -ge 0 ]; then evt_objname="${fields[$objname_col]}"; fi
+					if [ $desc_col -ge 0 ]; then evt_desc="${fields[$desc_col]}"; fi
+
+					alert_count=$((alert_count + 1))
+					event_summary="$event_summary WARNING: Event $evt_errcode on $evt_objtype $evt_objname - $evt_desc (seq:$evt_seq ts:$evt_ts) \n"
+				done < $tmp_file
+
+				if [ $alert_count -eq 0 ]; then
+					outputMess="OK: No new unresolved events \n"
+					exitCode=0
+				else
+					outputMess="WARNING: $alert_count new unresolved event(s) \n$event_summary"
+					exitCode=1
+				fi
 			fi
 		fi
 	;;
