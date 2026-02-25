@@ -205,11 +205,8 @@ if ($Check -eq "JobStatus") {
         }
         if ($skip) { continue }
 
-        # Get last session for this job
-        $lastSession = Get-VBRBackupSession -ErrorAction SilentlyContinue |
-            Where-Object { $_.JobId -eq $job.Id } |
-            Sort-Object -Property EndTime -Descending |
-            Select-Object -First 1
+        # Get last session using FindLastSession (v12 native, fastest method)
+        $lastSession = $job.FindLastSession()
 
         if ($null -eq $lastSession) {
             $warningJobs += "$jobName (no sessions found)"
