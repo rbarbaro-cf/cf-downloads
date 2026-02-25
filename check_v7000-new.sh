@@ -19,7 +19,7 @@
 # CHANGELOG
 #
 # 1.6.0 - Rich Barbaro
-# Added lseventlog check with baseline approach and error code exclusion.
+# Added lseventlog check - reports all unfixed alerts, no exclusions.
 # Added lsportfc check with node ID, speed mismatch detection.
 # Converted all dynamic-column checks to single SSH call.
 # Added LogLevel=ERROR to suppress SSH warnings in Nagios output.
@@ -102,7 +102,6 @@ HELP="
 		unified
 	    -i --> Provide the SSH identity file to use
 	    -w --> Warning threshold % for space checks (default: 80)
-	           For lseventlog: use -w init to create baseline
 	    -c --> Critical threshold % for space checks (default: 90)
             -h --> Print This Help Screen
 
@@ -529,49 +528,12 @@ case $query in
 
 	lseventlog)
 		# Check for unresolved alert events in the Storwize event log
-		# Uses a baseline file to track known events and only alert on new ones
-		# Exclude error codes that are covered by dedicated checks
-		EXCLUDE_CODES="986020"
-		baseline_file="/tmp/v7000_${storage}_eventlog.baseline"
+		# Reports ALL unfixed alerts. Events clear when fixed on the Storwize.
 
 		# Fetch all unfixed alerts (WITH header row)
 		$ssh $user@$storage -i $identity "lseventlog -filtervalue status=alert:fixed=no -delim :" > $tmp_file
 
-		# Init mode: create baseline from current alerts
-		if [ "$warn" = "init" ]; then
-			if [ -s $tmp_file ]; then
-				> "$baseline_file"
-				# Skip header line, parse data
-				tmp_data="/tmp/v7000_${storage}_eventlog_initdata.tmp"
-				sed '1d' "$tmp_file" > "$tmp_data"
-				while IFS=':' read -ra fields; do
-					evt_eventid="${fields[8]}"
-					evt_errcode="${fields[9]}"
-					skip=0
-					for code in $EXCLUDE_CODES; do
-						if [ "$evt_eventid" = "$code" -o "$evt_errcode" = "$code" ]; then skip=1; break; fi
-					done
-					if [ $skip -eq 0 ]; then
-						echo "${fields[0]}" >> "$baseline_file"
-					fi
-				done < "$tmp_data"
-				rm -f "$tmp_data"
-				evt_count=$(wc -l < "$baseline_file")
-				echo -ne "OK: Baseline created with $evt_count known events \n"
-				rm -f $tmp_file
-				exit 0
-			else
-				# No unfixed alerts - create empty baseline
-				> "$baseline_file"
-				echo -ne "OK: Baseline created with 0 known events \n"
-				rm -f $tmp_file
-				exit 0
-			fi
-		fi
-
-		# Normal mode: check for new events not in baseline
 		if [ ! -s $tmp_file ]; then
-			# No unfixed alerts at all
 			outputMess="OK: No unresolved events \n"
 			exitCode=0
 		else
@@ -598,41 +560,24 @@ case $query in
 				alert_count=0
 				event_summary=""
 
-				# Create baseline file if it doesn't exist (first run without init)
-				if [ ! -f "$baseline_file" ]; then
-					touch "$baseline_file"
-				fi
-
 				# Process data lines (skip header)
 				tmp_data="/tmp/v7000_${storage}_eventlog_data.tmp"
 				sed '1d' "$tmp_file" > "$tmp_data"
 
 				while IFS=':' read -ra fields; do
 					evt_seq="${fields[$seq_col]}"
-					evt_errcode=""
-					evt_eventid=""
-					if [ $errcode_col -ge 0 ]; then evt_errcode="${fields[$errcode_col]}"; fi
-					if [ $eventid_col -ge 0 ]; then evt_eventid="${fields[$eventid_col]}"; fi
-
-					# Skip excluded error codes (check both event_id and error_code)
-					skip=0
-					for code in $EXCLUDE_CODES; do
-						if [ "$evt_errcode" = "$code" -o "$evt_eventid" = "$code" ]; then skip=1; break; fi
-					done
-					if [ $skip -eq 1 ]; then continue; fi
-
-					# Skip baselined events
-					if grep -q "^${evt_seq}$" "$baseline_file" 2>/dev/null; then continue; fi
-
-					# This is a new, non-excluded event
 					evt_ts=""
 					evt_objtype=""
 					evt_objname=""
+					evt_eventid=""
+					evt_errcode=""
 					evt_desc=""
 
 					if [ $ts_col -ge 0 ]; then evt_ts="${fields[$ts_col]}"; fi
 					if [ $objtype_col -ge 0 ]; then evt_objtype="${fields[$objtype_col]}"; fi
 					if [ $objname_col -ge 0 ]; then evt_objname="${fields[$objname_col]}"; fi
+					if [ $eventid_col -ge 0 ]; then evt_eventid="${fields[$eventid_col]}"; fi
+					if [ $errcode_col -ge 0 ]; then evt_errcode="${fields[$errcode_col]}"; fi
 					if [ $desc_col -ge 0 ]; then evt_desc="${fields[$desc_col]}"; fi
 
 					# Use whichever ID is populated
@@ -645,10 +590,10 @@ case $query in
 				rm -f "$tmp_data"
 
 				if [ $alert_count -eq 0 ]; then
-					outputMess="OK: No new unresolved events \n"
+					outputMess="OK: No unresolved events \n"
 					exitCode=0
 				else
-					outputMess="WARNING: $alert_count new unresolved event(s) \n$event_summary"
+					outputMess="WARNING: $alert_count unresolved event(s) \n$event_summary"
 					exitCode=1
 				fi
 			fi
