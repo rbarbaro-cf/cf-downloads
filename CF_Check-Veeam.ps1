@@ -275,14 +275,11 @@ if ($Check -eq "BackupAge") {
         }
         if ($skip) { continue }
 
-        # Get last successful session for this job
-        $lastSession = Get-VBRBackupSession -ErrorAction SilentlyContinue |
-            Where-Object { $_.JobId -eq $job.Id -and $_.Result -ne "Failed" -and $_.State -eq "Stopped" } |
-            Sort-Object -Property EndTime -Descending |
-            Select-Object -First 1
+        # Get last session for this job
+        $lastSession = $job.FindLastSession()
 
         if ($null -eq $lastSession) {
-            $criticalJobs += "$jobName (no successful session found)"
+            $criticalJobs += "$jobName (no session found)"
             if ($returnCode -lt $returnCritical) { $returnCode = $returnCritical }
             continue
         }
