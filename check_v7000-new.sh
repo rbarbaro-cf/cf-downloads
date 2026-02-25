@@ -537,10 +537,11 @@ case $query in
 				# Extract sequence numbers, excluding filtered error codes
 				> "$baseline_file"
 				while IFS=':' read -ra fields; do
-					evt_errcode="${fields[8]}"
+					evt_eventid="${fields[8]}"
+					evt_errcode="${fields[9]}"
 					skip=0
 					for code in $EXCLUDE_CODES; do
-						if [ "$evt_errcode" = "$code" ]; then skip=1; break; fi
+						if [ "$evt_errcode" = "$code" -o "$evt_eventid" = "$code" ]; then skip=1; break; fi
 					done
 					if [ $skip -eq 0 ]; then
 						echo "${fields[0]}" >> "$baseline_file"
@@ -596,12 +597,14 @@ case $query in
 				while IFS=':' read -ra fields; do
 					evt_seq="${fields[$seq_col]}"
 					evt_errcode=""
+					evt_eventid=""
 					if [ $errcode_col -ge 0 ]; then evt_errcode="${fields[$errcode_col]}"; fi
+					if [ $eventid_col -ge 0 ]; then evt_eventid="${fields[$eventid_col]}"; fi
 
-					# Skip excluded error codes
+					# Skip excluded error codes (check both event_id and error_code)
 					skip=0
 					for code in $EXCLUDE_CODES; do
-						if [ "$evt_errcode" = "$code" ]; then skip=1; break; fi
+						if [ "$evt_errcode" = "$code" -o "$evt_eventid" = "$code" ]; then skip=1; break; fi
 					done
 					if [ $skip -eq 1 ]; then continue; fi
 
@@ -619,8 +622,12 @@ case $query in
 					if [ $objname_col -ge 0 ]; then evt_objname="${fields[$objname_col]}"; fi
 					if [ $desc_col -ge 0 ]; then evt_desc="${fields[$desc_col]}"; fi
 
+					# Use whichever ID is populated
+					evt_display_code="$evt_eventid"
+					if [ -n "$evt_errcode" ]; then evt_display_code="$evt_errcode"; fi
+
 					alert_count=$((alert_count + 1))
-					event_summary="$event_summary WARNING: Event $evt_errcode on $evt_objtype $evt_objname - $evt_desc (seq:$evt_seq ts:$evt_ts) \n"
+					event_summary="$event_summary WARNING: Event $evt_display_code on $evt_objtype $evt_objname - $evt_desc (seq:$evt_seq ts:$evt_ts) \n"
 				done < $tmp_file
 
 				if [ $alert_count -eq 0 ]; then
