@@ -1,61 +1,60 @@
 #!/bin/bash
 
-# Editing Author:	Niels van Aert
-# Editing Date:		30-04-2019
-# Custom Version	1.4.1
-#
-# Modified:		2025 - Added SSH connectivity validation, lspoolspace,
-#			lsvdiskspace, lsportfc, lseventlog checks. Fixed false-OK
-#			on SSH failure. Fixed temp file variable interpolation.
-
 # Original Author:	Lazzarin Alberto
 # Original Date:	10-04-2013
-# Original Version	1.4
+# Original Version:	1.0
+#
+# Editing Author:	Niels van Aert
+# Editing Date:		30-04-2019
+# Editing Version:	1.4.1
+#
+# Editing Author:	Rich Barbaro
+# Editing Date:		25-02-2026
+# Editing Version:	1.6.0
 #
 # This plugin checks various attributes of a Lenovo / IBM Storwize v3700 / v7000.
 # To use this script you need to create a so called Monitoring user on the SAN with an SSH certificate.
 # The help is included into the script.
 #
-#
-#
 # CHANGELOG
 #
-# 1.6.0
-# Added lseventlog check for unresolved alert/warning events.
-# Fixed SSH connectivity test to use lssystem instead of echo (restricted shell).
+# 1.6.0 - Rich Barbaro
+# Added lseventlog check with baseline approach and error code exclusion.
+# Added lsportfc check with node ID, speed mismatch detection.
+# Converted all dynamic-column checks to single SSH call.
+# Added LogLevel=ERROR to suppress SSH warnings in Nagios output.
 #
-# 1.5.0
-# Added SSH connectivity validation - all checks now return CRITICAL on SSH failure
-# instead of false OK. Added lspoolspace, lsvdiskspace, and lsportfc checks.
-# Added -w and -c threshold options for space checks.
+# 1.5.0 - Rich Barbaro
+# Added SSH connectivity validation (lssystem) - prevents false OKs.
+# Added lspoolspace and lsvdiskspace checks with -w/-c thresholds.
+# Added data guards on all legacy checks for empty SSH responses.
 # Fixed temp file variable interpolation (${storage}_${query}).
-# Fixed $mdisk_name typo in lsvdisk ATTENTION output.
-# Fixed $disk_status typo in lsdrive ATTENTION output.
+# Fixed $mdisk_name typo in lsvdisk, $disk_status typo in lsdrive.
 # Added HOME export for Nagios service execution context.
 # Added rm -f to prevent errors on missing tmp files.
 #
-# 1.4.1 
-# Added the option to specify -i to specify an identity file, rather than expect it to be at a certain location.
-# Commented out rm $tmp_file_OK as it was throwing an error on recent firmware versions.
-# Fixed incorrect line-formatting which caused the plugin to refuse to run on some systems.
-# 1.4 Made by Andrea Tedesco [andrea85 . tedesco @ gmail . com]
-# Add check of v7000 Unified
-# 1.3 Made by Ivan Bergantin [ivan . bergantin @ gmail . com] suggested by Leandro Freitas [leandro @ nodeps . com . br]
-# Add short output in "Service Status Details For Host" view, and detailed output in "Service Information"view
+# 1.4.1 - Niels van Aert
+# Added the option to specify -i to specify an identity file.
+# Commented out rm $tmp_file_OK as it was throwing an error on recent firmware.
+# Fixed incorrect line-formatting which caused the plugin to refuse to run.
 #
-# 1.2 Made by Feilong
+# 1.4 - Andrea Tedesco
+# Add check of v7000 Unified.
+#
+# 1.3 - Ivan Bergantin
+# Add short output in service status view, detailed output in service info view.
+#
+# 1.2 - Feilong
 # Add check of mirror status between two volumes on two IBM V7000.
-# It check the number of mirrors, the numbers of consitent and synchronized mirrors. If they are differents, the status returned is critical.
 #
 # 1.1
-# Change login method from from 'plink' to ssh.
-# Add "OK" and "ATTENTION" in the output.
+# Change login method from plink to ssh. Add OK/ATTENTION in output.
 #
-# 1.0
+# 1.0 - Lazzarin Alberto
 # First release.
 #
 
-ssh="/usr/bin/ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+ssh="/usr/bin/ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 exitCode=0
 export HOME=${HOME:-/home/nagios}
 
@@ -448,13 +447,15 @@ case $query in
 
 	lsportfc)
 		# Check FC port status, link state, and speed
-		$ssh $user@$storage -i $identity lsportfc -delim : -nohdr > $tmp_file
+		# Fetch WITH header row in single call
+		$ssh $user@$storage -i $identity lsportfc -delim : > $tmp_file
 
 		if [ ! -s $tmp_file ]; then
 			outputMess="CRITICAL: No FC port data returned \n"
 			exitCode=2
 		else
-			header=$($ssh $user@$storage -i $identity lsportfc -delim : | head -1)
+			# Read header from first line
+			header=$(head -1 "$tmp_file")
 			IFS=':' read -ra cols <<< "$header"
 			id_col=-1; status_col=-1; speed_col=-1; nodeid_col=-1; nodename_col=-1; att_speed_col=-1
 			for i in "${!cols[@]}"; do
@@ -474,6 +475,8 @@ case $query in
 				exitCode=3
 			else
 				outputMess="OK: FC Ports \n"
+				tmp_data="/tmp/v7000_${storage}_portfc_data.tmp"
+				sed '1d' "$tmp_file" > "$tmp_data"
 				while IFS=':' read -ra fields; do
 					fc_id="${fields[$id_col]}"
 					fc_status="${fields[$status_col]}"
@@ -518,7 +521,8 @@ case $query in
 						outputMess="$outputMess CRITICAL: $fc_node FC Port $fc_id status: $fc_status speed: $fc_speed \n"
 						exitCode=2
 					fi
-				done < $tmp_file
+				done < "$tmp_data"
+				rm -f "$tmp_data"
 			fi
 		fi
 	;;
@@ -530,44 +534,49 @@ case $query in
 		EXCLUDE_CODES="986020"
 		baseline_file="/tmp/v7000_${storage}_eventlog.baseline"
 
+		# Fetch all unfixed alerts (WITH header row)
+		$ssh $user@$storage -i $identity "lseventlog -filtervalue status=alert:fixed=no -delim :" > $tmp_file
+
 		# Init mode: create baseline from current alerts
 		if [ "$warn" = "init" ]; then
-			$ssh $user@$storage -i $identity "lseventlog -filtervalue status=alert:fixed=no -delim : -nohdr" > $tmp_file
-			if [ -f $tmp_file ]; then
-				# Extract sequence numbers, excluding filtered error codes
+			if [ -s $tmp_file ]; then
 				> "$baseline_file"
+				# Skip header line, parse data
+				tmp_data="/tmp/v7000_${storage}_eventlog_initdata.tmp"
+				sed '1d' "$tmp_file" > "$tmp_data"
 				while IFS=':' read -ra fields; do
 					evt_eventid="${fields[8]}"
 					evt_errcode="${fields[9]}"
 					skip=0
 					for code in $EXCLUDE_CODES; do
-						if [ "$evt_errcode" = "$code" -o "$evt_eventid" = "$code" ]; then skip=1; break; fi
+						if [ "$evt_eventid" = "$code" -o "$evt_errcode" = "$code" ]; then skip=1; break; fi
 					done
 					if [ $skip -eq 0 ]; then
 						echo "${fields[0]}" >> "$baseline_file"
 					fi
-				done < $tmp_file
+				done < "$tmp_data"
+				rm -f "$tmp_data"
 				evt_count=$(wc -l < "$baseline_file")
 				echo -ne "OK: Baseline created with $evt_count known events \n"
 				rm -f $tmp_file
 				exit 0
 			else
-				echo -ne "CRITICAL: Could not retrieve event log for baseline \n"
+				# No unfixed alerts - create empty baseline
+				> "$baseline_file"
+				echo -ne "OK: Baseline created with 0 known events \n"
 				rm -f $tmp_file
-				exit 2
+				exit 0
 			fi
 		fi
 
 		# Normal mode: check for new events not in baseline
-		$ssh $user@$storage -i $identity "lseventlog -filtervalue status=alert:fixed=no -delim : -nohdr" > $tmp_file
-
 		if [ ! -s $tmp_file ]; then
 			# No unfixed alerts at all
 			outputMess="OK: No unresolved events \n"
 			exitCode=0
 		else
-			# Get header for column mapping
-			header=$($ssh $user@$storage -i $identity "lseventlog -filtervalue status=alert:fixed=no -delim :" | head -1)
+			# Read header from first line
+			header=$(head -1 "$tmp_file")
 			IFS=':' read -ra cols <<< "$header"
 			seq_col=-1; ts_col=-1; objtype_col=-1; objname_col=-1; eventid_col=-1; errcode_col=-1; desc_col=-1
 			for i in "${!cols[@]}"; do
@@ -593,6 +602,10 @@ case $query in
 				if [ ! -f "$baseline_file" ]; then
 					touch "$baseline_file"
 				fi
+
+				# Process data lines (skip header)
+				tmp_data="/tmp/v7000_${storage}_eventlog_data.tmp"
+				sed '1d' "$tmp_file" > "$tmp_data"
 
 				while IFS=':' read -ra fields; do
 					evt_seq="${fields[$seq_col]}"
@@ -628,7 +641,8 @@ case $query in
 
 					alert_count=$((alert_count + 1))
 					event_summary="$event_summary WARNING: Event $evt_display_code on $evt_objtype $evt_objname - $evt_desc (seq:$evt_seq ts:$evt_ts) \n"
-				done < $tmp_file
+				done < "$tmp_data"
+				rm -f "$tmp_data"
 
 				if [ $alert_count -eq 0 ]; then
 					outputMess="OK: No new unresolved events \n"
@@ -643,14 +657,14 @@ case $query in
 
 	lsvdiskspace)
 		# Check vdisk capacity usage with warning/critical thresholds
-		$ssh $user@$storage -i $identity lsvdisk -bytes -delim : -nohdr > $tmp_file
+		# Fetch WITH header row in single call
+		$ssh $user@$storage -i $identity lsvdisk -bytes -delim : > $tmp_file
 
 		if [ ! -s $tmp_file ]; then
 			outputMess="CRITICAL: No vdisk data returned \n"
 			exitCode=2
 		else
-			# Get header to find column positions
-			header=$($ssh $user@$storage -i $identity lsvdisk -bytes -delim : | head -1)
+			header=$(head -1 "$tmp_file")
 			IFS=':' read -ra cols <<< "$header"
 			name_col=-1; cap_col=-1; used_col=-1
 			for i in "${!cols[@]}"; do
@@ -666,6 +680,8 @@ case $query in
 				exitCode=3
 			else
 				outputMess="OK: VDisk Space \n"
+				tmp_data="/tmp/v7000_${storage}_vdiskspace_data.tmp"
+				sed '1d' "$tmp_file" > "$tmp_data"
 				while IFS=':' read -ra fields; do
 					vd_name="${fields[$name_col]}"
 					vd_cap="${fields[$cap_col]}"
@@ -686,20 +702,22 @@ case $query in
 							outputMess="$outputMess OK: VDisk $vd_name ${pct}% used (${vd_used_gb}GB/${vd_cap_gb}GB) \n"
 						fi
 					fi
-				done < $tmp_file
+				done < "$tmp_data"
+				rm -f "$tmp_data"
 			fi
 		fi
 	;;
 
 	lspoolspace)
 		# Check storage pool capacity usage with warning/critical thresholds
-		$ssh $user@$storage -i $identity lsmdiskgrp -bytes -delim : -nohdr > $tmp_file
+		# Fetch WITH header row in single call
+		$ssh $user@$storage -i $identity lsmdiskgrp -bytes -delim : > $tmp_file
 
 		if [ ! -s $tmp_file ]; then
 			outputMess="CRITICAL: No pool data returned \n"
 			exitCode=2
 		else
-			header=$($ssh $user@$storage -i $identity lsmdiskgrp -bytes -delim : | head -1)
+			header=$(head -1 "$tmp_file")
 			IFS=':' read -ra cols <<< "$header"
 			name_col=-1; cap_col=-1; free_col=-1
 			for i in "${!cols[@]}"; do
@@ -715,6 +733,8 @@ case $query in
 				exitCode=3
 			else
 				outputMess="OK: Pool Space \n"
+				tmp_data="/tmp/v7000_${storage}_poolspace_data.tmp"
+				sed '1d' "$tmp_file" > "$tmp_data"
 				while IFS=':' read -ra fields; do
 					pool_name="${fields[$name_col]}"
 					pool_cap="${fields[$cap_col]}"
@@ -737,7 +757,8 @@ case $query in
 							outputMess="$outputMess OK: Pool $pool_name ${pct}% used (${pool_used_gb}GB/${pool_cap_gb}GB, ${pool_free_gb}GB free) \n"
 						fi
 					fi
-				done < $tmp_file
+				done < "$tmp_data"
+				rm -f "$tmp_data"
 			fi
 		fi
 	;;
