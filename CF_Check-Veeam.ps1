@@ -1,32 +1,74 @@
 ################################################################################
 # Nagios Veeam Backup & Replication Monitoring Plugin                          #
-# Version: 3.0                                                                 #
+# Version: 4.0                                                                 #
 # Requires: Veeam v12+ PowerShell Module, NCPA Agent                          #
 #                                                                              #
 # Checks:                                                                      #
 #   RepoSpace  - Repository space utilization                                  #
 #   JobStatus  - Last backup job result (success/warning/fail)                 #
-#   BackupAge  - Hours since last restore point per VM                         #
+#   BackupAge  - Hours since last restore point per job                        #
 #   License    - Days until license expiration                                 #
 #                                                                              #
-# Usage:                                                                       #
-#   CF_Check-Veeam.ps1 -Check RepoSpace [-Name "repo"] [-Warning 80] [-Critical 95]
-#   CF_Check-Veeam.ps1 -Check JobStatus [-Exclude "job1,job2"]                #
-#   CF_Check-Veeam.ps1 -Check BackupAge [-Warning 24] [-Critical 48] [-Exclude "vm1,vm2"]
-#   CF_Check-Veeam.ps1 -Check License [-Warning 30] [-Critical 14]            #
-#   CF_Check-Veeam.ps1 -List <RepoSpace|JobStatus|BackupAge>                  #
+# Usage (NCPA-friendly, no dashes):                                            #
+#   CF_Check-Veeam.ps1 RepoSpace [Warning=80] [Critical=95] [Name=Hit-CHI]    #
+#   CF_Check-Veeam.ps1 JobStatus [Exclude=job1,job2]                          #
+#   CF_Check-Veeam.ps1 BackupAge [Warning=24] [Critical=48] [Exclude=vm1,vm2] #
+#   CF_Check-Veeam.ps1 License [Warning=30] [Critical=14]                     #
+#   CF_Check-Veeam.ps1 List [RepoSpace|JobStatus|BackupAge]                   #
+#                                                                              #
+# NCPA examples:                                                               #
+#   -a "RepoSpace" -a "Warning=80" -a "Critical=95" -a "Name=Hit-CHI"         #
+#   -a "JobStatus" -a "Exclude=TestJob,OldJob"                                #
+#   -a "BackupAge" -a "Warning=36" -a "Critical=72"                           #
+#   -a "License" -a "Warning=60" -a "Critical=30"                             #
+#   -a "List" -a "RepoSpace"                                                  #
 ################################################################################
 
 param(
-    [ValidateSet("RepoSpace","JobStatus","BackupAge","License")]
-    [string]$Check,
-    [string]$Name,
-    [string]$Exclude,
-    [int]$Warning,
-    [int]$Critical,
-    [ValidateSet("RepoSpace","JobStatus","BackupAge","License")]
-    [string]$List
+    [Parameter(ValueFromRemainingArguments=$true)]
+    [string[]]$Arguments
 )
+
+# Parse arguments: first arg is check type, rest are key=value pairs
+$Check = ""
+$List = ""
+$Name = ""
+$Exclude = ""
+$Warning = 0
+$Critical = 0
+
+$validChecks = @("RepoSpace","JobStatus","BackupAge","License")
+
+if ($Arguments.Count -lt 1) {
+    Write-Host "UNKNOWN - No arguments provided. Usage: CF_Check-Veeam.ps1 <CheckType> [Key=Value ...]"
+    Exit 3
+}
+
+# First argument is check type or List
+$firstArg = $Arguments[0]
+if ($firstArg -eq "List") {
+    $List = if ($Arguments.Count -gt 1) { $Arguments[1] } else { "All" }
+} elseif ($validChecks -contains $firstArg) {
+    $Check = $firstArg
+} else {
+    Write-Host "UNKNOWN - Invalid check type '$firstArg'. Valid: $($validChecks -join ', '), List"
+    Exit 3
+}
+
+# Parse remaining key=value pairs
+for ($i = 1; $i -lt $Arguments.Count; $i++) {
+    $arg = $Arguments[$i]
+    if ($arg -match '^(\w+)=(.+)$') {
+        $key = $matches[1]
+        $val = $matches[2]
+        switch ($key.ToLower()) {
+            "name"     { $Name = $val }
+            "exclude"  { $Exclude = $val }
+            "warning"  { $Warning = [int]$val }
+            "critical" { $Critical = [int]$val }
+        }
+    }
+}
 
 # Exit codes
 $returnOK = 0
@@ -44,7 +86,7 @@ if (!(Get-Module Veeam.Backup.PowerShell -ErrorAction SilentlyContinue)) {
 
 # Validate required params
 if (!$Check -and !$List) {
-    Write-Host "UNKNOWN - Must specify -Check or -List"
+    Write-Host "UNKNOWN - Must specify check type or List"
     Exit $returnUnknown
 }
 
